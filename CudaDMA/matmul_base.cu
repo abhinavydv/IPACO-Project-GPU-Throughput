@@ -8,72 +8,78 @@
 #include <tuple>
 #include <ctime>
 #include <stdio.h>
-#include "./CudaDMA/include/cudadma.h"
 
 using namespace std;
 
 #define WARP_SIZE 32
-#define VEC_ELMTS 32
-#define COMPUTE_THREADS 32
-#define DMA_THREADS_SEQ 4
-#define DMA_THREADS_STRD 4
-
 
 
 // GPU function to multiply two matrices `mat1` and `mat2`
 // Tiling is done using shared memory to reduce global memory accesses
-__global__ void matmul(float *d_mat1, float *d_mat2, float *d_result, int m1, int paddedN, int m2) {
-    __shared__ float buff [ VEC_ELMTS ];
-    __shared__ float mat [ VEC_ELMTS ][ COMPUTE_THREADS ];
+__global__ void matmul(float *mat1, float *mat2, float *result, int m1, int paddedN, int n2)
+{
+    // Create shared memory for the two point sets
+    __shared__ float sharedA[WARP_SIZE * WARP_SIZE];
+    __shared__ float sharedB[WARP_SIZE * WARP_SIZE];
 
-    cudaDMASequential<sizeof(float) * VEC_ELMTS / DMA_THREADS_SEQ> dma_ld_0(1, DMA_THREADS_SEQ, COMPUTE_THREADS,
-             COMPUTE_THREADS, sizeof(float) * VEC_ELMTS);
+    // Calculate the index into the shared memory
+    int localIdx = threadIdx.y * blockDim.x + threadIdx.x;
 
-    cudaDMAStrided<sizeof(float) * VEC_ELMTS>
-    dma_ld_1(2, DMA_THREADS_STRD, COMPUTE_THREADS,
-             COMPUTE_THREADS + DMA_THREADS_SEQ,
-             sizeof(float) * COMPUTE_THREADS,
-             VEC_ELMTS, sizeof(float) * n,
-             sizeof(float) * COMPUTE_THREADS);
+    // Initialize the temporary result to 0
+    float tmp = 0.0f;
 
-    int ind = blockIdx.x * COMPUTE_THREADS + threadIdx.x;
+    // // Check if the thread is within the bounds of pointSetA
+    // if (blockIdx.y * blockDim.y + threadIdx.y >= m1)
+    //     return;
 
-    if ( threadIdx .x < COMPUTE_THREADS ) {
-        dma_ld_0 . start_async_dma ();
-        dma_ld_1 . start_async_dma ();
-        float res = 0. f ;
-        for ( int i =0; i < n; i += VEC_ELMTS ) {
-            dma_ld_0 . wait_for_dma_finish ();
-            dma_ld_1 . wait_for_dma_finish ();
-            for ( int j =0; j < VEC_ELMTS ; j ++) {
-                res += mat [j ][ threadIdx .x ]* buff [ j ];
-            }
-            dma_ld_0 . start_async_dma ();
-            dma_ld_1 . start_async_dma ();
+    for (int i = 0; i < paddedN / blockDim.x; i++)
+    {
+        // Load pointSetA and pointSetB into shared memory
+        int globalIdxA = paddedN * (blockDim.y * blockIdx.y + threadIdx.y) + blockDim.x * i + threadIdx.x;
+        // int globalIdxB = paddedN * (blockDim.y * blockIdx.x + threadIdx.y) + blockDim.x * i + threadIdx.x;
+        int globalIdxB = paddedN * (blockDim.y * i + threadIdx.y) + blockDim.x * blockIdx.x + threadIdx.x;
+
+        // Copy a tile of pointSetA and pointSetB into shared memory
+        // Each thread copies one element
+
+        if (globalIdxA < m1 * paddedN)
+            sharedA[localIdx] = mat1[globalIdxA];
+        else
+            sharedA[localIdx] = 0.0f;
+
+        if (globalIdxB < paddedN * n2)
+            sharedB[localIdx] = mat2[globalIdxB];
+        else
+            sharedB[localIdx] = 0.0f;
+
+        // Synchronize threads to ensure all data is loaded
+        __syncthreads();
+
+        // Compute the temporary result
+        for (int j = 0; j < blockDim.x; j++)
+        {
+            int indA = threadIdx.y * blockDim.x + j;
+            int indB = threadIdx.x + blockDim.x * j;
+            tmp += sharedA[indA] * sharedB[indB];
+            // if (threadIdx.x == 0 && blockIdx.x == 0 && threadIdx.y == 0 && blockIdx.y == 0)
+            // {
+            //     printf("tmp: %f, indA: %d, indB: %d, a: %f, b: %f\n", tmp, indA, indB, sharedA[indA], sharedB[indB]);
+            // }
         }
-        ind = blockIdx . x* COMPUTE_THREADS + threadIdx .x ;
-        if ( ind < n ) 
-            y[ ind ] = alpha * res ;
+
+        // next load should happen only after this iteration's computation
+        __syncthreads();
     }
-    else if ( dma_ld_0 . owns_this_thread ()) {
-        dma_ld_0 . wait_for_dma_start ();
-        for ( int idx =0; idx < n; idx += VEC_ELMTS ) {
-            dma_ld_0 . execute_dma (x , buff );
-            dma_ld_0 . finish_async_dma ();
-            dma_ld_0 . wait_for_dma_start ();
-            x += VEC_ELMTS ;
-        }
-    }
-    else if ( dma_ld_1 . owns_this_thread ()) {
-        dma_ld_1 . wait_for_dma_start ();
-        for ( int idx =0; idx < n; idx += VEC_ELMTS ) {
-            dma_ld_1 . execute_dma (
-            A+ idx *m+ blockIdx . x* COMPUTE_THREADS , mat );
-            dma_ld_1 . finish_async_dma ();
-            dma_ld_1 . wait_for_dma_start ();
-        }
-    }
+
+    // Check if the thread is within the bounds of pointSetB
+    if (blockIdx.x * blockDim.x + threadIdx.x >= n2)
+        return;
+
+    // Store the computed distance in the global memory
+    int idx = n2 * (blockDim.y * blockIdx.y + threadIdx.y) + blockDim.x * blockIdx.x + threadIdx.x;
+    result[idx] = tmp;
 }
+
 
 // Function to read a CSV file and return the data as a float array
 // The function also returns the number of rows and columns in the CSV file
@@ -231,19 +237,20 @@ int main(int argc, char *argv[])
     cudaMalloc(&d_mat2, m2 * paddedN * sizeof(float));
     cudaMalloc(&d_result, m1 * m2 * sizeof(float));
 
-    double start_time = (double)clock() / CLOCKS_PER_SEC;
     // Copy the dataset to GPU
     cudaMemcpy(d_mat1, mat1, m1 * paddedN * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_mat2, mat2, m2 * paddedN * sizeof(float), cudaMemcpyHostToDevice);
-
+    
     dim3 thread(WARP_SIZE, WARP_SIZE);  // 32x32 threads per block
     dim3 block((m2 + thread.x - 1) / thread.x, (m1 + thread.y - 1) / thread.y);
     // Launch the kernel
+    double start_time = (double)clock() / CLOCKS_PER_SEC;
     matmul<<<block, thread>>>(d_mat1, d_mat2, d_result, m1, paddedN, m2);
-    cudaMemcpy(result, d_result, m1 * m2 * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Calculate the elapsed time
+    cudaDeviceSynchronize();
     double end_time = (double)clock() / CLOCKS_PER_SEC;
+    cudaMemcpy(result, d_result, m1 * m2 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Calculate the elapsed time
     elapsed_time = end_time - start_time;
 
     // print the elapsed_time
